@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Score Annotator</title>
+  
+  <!-- Tailwind CSS for styling -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Babel to translate JSX in the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Import Map to load React and Lucide Icons natively in the browser -->
+  <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "lucide-react": "https://esm.sh/lucide-react@0.292.0"
+      }
+    }
+  </script>
+
+  <style>
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; }
+    #root { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- The main React Application -->
+  <script type="text/babel" data-type="module">
+    import React, { useState, useEffect, useRef } from 'react';
+    import { createRoot } from 'react-dom/client';
+    import { 
+      Upload, ChevronLeft, ChevronRight, Type, 
+      MousePointer2, PenTool, Music, Settings, 
+      Trash2, Download, Palette, Type as TypeIcon,
+      Undo, Redo, Copy, Key, Highlighter,
+      Menu, PanelRight, BookOpen, Plus, X, Save, FolderOpen,
+      ZoomIn, ZoomOut, BoxSelect, LayoutGrid, File, Rows, HelpCircle
+    } from 'lucide-react';
+
+    // --- MUSICAL LOGIC & SMART PARSER ---
+    const PITCHES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+    const ROMAN = ['I', 'bII', 'II', 'bIII', 'III', 'IV', '#IV', 'V', 'bVI', 'VI', 'bVII', 'VII'];
+    const ROMAN_MINOR = ['i', 'bii', 'ii', 'biii', 'iii', 'iv', '#iv', 'v', 'bvi', 'vi', 'bvii', 'vii'];
+    const NASHVILLE = ['1', 'b2', '2', 'b3', '3', '4', '#4', '5', 'b6', '6', 'b7', '7'];
+
+    const getRootIndex = (str, keyIndex) => {
+      const pIdx = PITCHES.findIndex(p => str.startsWith(p));
+      if (pIdx !== -1) return { index: pIdx, match: PITCHES[pIdx], type: 'jazz' };
+      
+      const rIdx = ROMAN.findIndex(r => str.startsWith(r));
+      if (rIdx !== -1) return { index: (keyIndex + rIdx) % 12, match: ROMAN[rIdx], type: 'roman_maj' };
+      
+      const rmIdx = ROMAN_MINOR.findIndex(rm => str.startsWith(rm));
+      if (rmIdx !== -1) return { index: (keyIndex + rmIdx) % 12, match: ROMAN_MINOR[rmIdx], type: 'roman_min' };
+
+      const nIdx = NASHVILLE.findIndex(n => str.startsWith(n));
+      if (nIdx !== -1) return { index: (keyIndex + nIdx) % 12, match: NASHVILLE[nIdx], type: 'nashville' };
+
+      return null;
+    };
+
+    const formatQualityStr = (q, prefs) => {
+      let f = q;
+      if (prefs.halfDim !== 'm7b5') f = f.replace(/m7b5/g, prefs.halfDim);
+      if (prefs.dim !== 'dim') f = f.replace(/dim/g, prefs.dim);
+      if (prefs.major !== 'maj') f = f.replace(/maj/g, prefs.major);
+      
+      if (prefs.minor !== 'm' && f.startsWith('m')) f = prefs.minor + f.substring(1);
+      return f;
+    };
+
+    const parseAndTranslateChord = (input, globalKey, prefs, dict) => {
+      if (!input) return { jazz: '', roman: '', nashville: '' };
+      
+      const customMatch = dict.find(d => d.trigger.toLowerCase() === input.toLowerCase());
+      if (customMatch) return { jazz: customMatch.jazz, roman: customMatch.roman, nashville: customMatch.nashville };
+
+      const keyIndex = PITCHES.indexOf(globalKey) || 0;
+
+      if (input.includes('|')) {
+        const [top, bottom] = input.split('|');
+        const t = parseAndTranslateChord(top.trim(), globalKey, prefs, dict);
+        const b = parseAndTranslateChord(bottom.trim(), globalKey, prefs, dict);
+        return { jazz: `${t.jazz} | ${b.jazz}`, roman: `${t.roman} | ${b.roman}`, nashville: `${t.nashville} | ${b.nashville}` };
+      }
+      
+      if (input.includes('/')) {
+        const [base, bass] = input.split('/');
+        const ba = parseAndTranslateChord(base.trim(), globalKey, prefs, dict);
+        const bs = parseAndTranslateChord(bass.trim(), globalKey, prefs, dict);
+        return {
+          jazz: `${ba.jazz}/${bs.jazz.replace(/[^A-G#b]/g, '')}`,
+          roman: `${ba.roman}/${bs.roman.replace(/[^IivVb#]/g, '')}`,
+          nashville: `${ba.nashville}/${bs.nashville.replace(/[^1-7b#]/g, '')}`
+        };
+      }
+
+      const rootData = getRootIndex(input, keyIndex);
+      if (!rootData) return { jazz: input, roman: input, nashville: input };
+
+      const qualityAndExtensions = input.substring(rootData.match.length);
+      const distance = (rootData.index - keyIndex + 12) % 12;
+
+      const isMinor = rootData.type === 'roman_min' || qualityAndExtensions.startsWith('m') || qualityAndExtensions.startsWith('dim');
+      let romanBase = isMinor ? ROMAN_MINOR[distance] : ROMAN[distance];
+      let romanQuality = qualityAndExtensions;
+      
+      if (romanQuality.startsWith('m') && !romanQuality.startsWith('maj')) romanQuality = romanQuality.substring(1);
+
+      if (isMinor && prefs.romanCase === 'upper') {
+        romanBase = ROMAN[distance];
+        if (!qualityAndExtensions.startsWith('dim') && !qualityAndExtensions.startsWith('m7b5')) romanQuality = 'm' + romanQuality; 
+      }
+
+      return {
+        jazz: `${PITCHES[rootData.index]}${formatQualityStr(qualityAndExtensions, prefs)}`,
+        roman: `${romanBase}${formatQualityStr(romanQuality, prefs)}`,
+        nashville: `${NASHVILLE[distance]}${formatQualityStr(qualityAndExtensions, prefs)}`
+      };
+    };
+
+    const PageThumbnail = ({ pdfDoc, pageNum, isActive, onClick }) => {
+      const thumbCanvasRef = useRef(null);
+      const renderTaskRef = useRef(null);
+
+      useEffect(() => {
+        if (!pdfDoc) return;
+        let isMounted = true;
+        const renderThumb = async () => {
+          try {
+            const page = await pdfDoc.getPage(pageNum);
+            const viewport = page.getViewport({ scale: 0.25 }); 
+            const canvas = thumbCanvasRef.current;
+            if (!canvas || !isMounted) return;
+            const context = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+
+            if (renderTaskRef.current) renderTaskRef.current.cancel();
+            renderTaskRef.current = page.render({ canvasContext: context, viewport });
+          } catch (err) {}
+        };
+        renderThumb();
+        return () => { isMounted = false; if(renderTaskRef.current) renderTaskRef.current.cancel(); };
+      }, [pdfDoc, pageNum]);
+
+      return (
+        <div onClick={onClick} className={`cursor-pointer transition-all border-2 rounded overflow-hidden flex-shrink-0 bg-white ${isActive ? 'border-blue-500 shadow-md scale-105' : 'border-transparent hover:border-slate-300'}`}>
+          <canvas ref={thumbCanvasRef} className="block w-24 h-auto" />
+        </div>
+      );
+    };
+
+    function App() {
+      const [pdfReady, setPdfReady] = useState(false);
+      const [pdfDoc, setPdfDoc] = useState(null);
+      const [pageNum, setPageNum] = useState(1);
+      const [numPages, setNumPages] = useState(0);
+      const [zoom, setZoom] = useState(1.5);
+      const zoomRef = useRef(zoom);
+      const [viewMode, setViewMode] = useState('single'); // 'single' | 'continuous'
+      
+      const [currentKey, setCurrentKey] = useState('C'); 
+      const [tool, setTool] = useState('select'); 
+      const [showGallery, setShowGallery] = useState(false);
+      
+      // Custom Dictionary, Prefs, & Info Modal
+      const [showDictModal, setShowDictModal] = useState(false);
+      const [showInfoModal, setShowInfoModal] = useState(false);
+      const [dictTab, setDictTab] = useState('prefs'); 
+      const [chordPrefs, setChordPrefs] = useState({ minor: 'm', major: 'maj', dim: 'dim', halfDim: 'm7b5', romanCase: 'lower' });
+      const [customPrefModes, setCustomPrefModes] = useState({}); 
+      const [chordDict, setChordDict] = useState([]);
+      const [newDictEntry, setNewDictEntry] = useState({ trigger: '', jazz: '', roman: '', nashville: '' });
+
+      // UI State
+      const [showLeftPanel, setShowLeftPanel] = useState(true);
+      const [showRightPanel, setShowRightPanel] = useState(true);
+      const [isMobile, setIsMobile] = useState(false);
+
+      // Undo/Redo & State
+      const [history, setHistory] = useState([[]]);
+      const [historyIndex, setHistoryIndex] = useState(0);
+      const [annotations, setAnnotations] = useState([]); 
+
+      const [selectedIds, setSelectedIds] = useState([]);
+      const [clipboard, setClipboard] = useState([]);
+      const [lasso, setLasso] = useState(null); 
+      const [dragContext, setDragContext] = useState(null);
+      
+      // Panning and Parameters State
+      const [isPanning, setIsPanning] = useState(false);
+      const panStartRef = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
+      
+      const [pasteAtCursor, setPasteAtCursor] = useState(true);
+      const [preserveFormatting, setPreserveFormatting] = useState(false);
+      const latestMousePos = useRef({ x: 50, y: 50, page: 1 });
+      
+      const [isDrawing, setIsDrawing] = useState(false);
+      const [currentPath, setCurrentPath] = useState(null);
+      const [currentPenSize, setCurrentPenSize] = useState(3);
+      const [currentHighlighterSize, setCurrentHighlighterSize] = useState(16);
+      const [currentColor, setCurrentColor] = useState('#2563eb');
+      const [currentFontSize, setCurrentFontSize] = useState(16);
+
+      const canvasRefs = useRef({});
+      const pageRefs = useRef({});
+      const workspaceRef = useRef(null);
+      const fileInputRef = useRef(null);
+      const projectImportRef = useRef(null);
+
+      // --- PERSISTENCE LOGIC ---
+      const [isInitialized, setIsInitialized] = useState(false);
+
+      useEffect(() => {
+        const savedData = localStorage.getItem('score_annotator_data');
+        if (savedData) {
+          try {
+            const parsed = JSON.parse(savedData);
+            if (parsed.annotations) { setAnnotations(parsed.annotations); setHistory([parsed.annotations]); setHistoryIndex(0); }
+            if (parsed.chordPrefs) setChordPrefs(parsed.chordPrefs);
+            if (parsed.chordDict) setChordDict(parsed.chordDict);
+            if (parsed.preserveFormatting !== undefined) setPreserveFormatting(parsed.preserveFormatting);
+          } catch (e) { console.error("Failed to load saved data.", e); }
+        }
+        setIsInitialized(true);
+      }, []);
+
+      useEffect(() => {
+        if (isInitialized) localStorage.setItem('score_annotator_data', JSON.stringify({ annotations, chordPrefs, chordDict, preserveFormatting }));
+      }, [annotations, chordPrefs, chordDict, preserveFormatting, isInitialized]);
+
+      useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+
+      // --- PROJECT EXPORT / IMPORT ---
+      const exportProject = () => {
+        const data = JSON.stringify({ annotations, chordPrefs, chordDict, preserveFormatting }, null, 2);
+        const blob = new Blob([data], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `score_analysis_${new Date().toISOString().slice(0,10)}.json`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      };
+
+      const importProject = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const parsed = JSON.parse(event.target.result);
+            if (parsed.annotations) { setAnnotations(parsed.annotations); setHistory(prev => [...prev, parsed.annotations]); setHistoryIndex(prev => prev + 1); setSelectedIds([]); }
+            if (parsed.chordPrefs) setChordPrefs(parsed.chordPrefs);
+            if (parsed.chordDict) setChordDict(parsed.chordDict);
+            if (parsed.preserveFormatting !== undefined) setPreserveFormatting(parsed.preserveFormatting);
+          } catch (err) { alert("Invalid project file format."); }
+        };
+        reader.readAsText(file);
+        e.target.value = ''; 
+      };
+
+      // --- RESPONSIVENESS & ZOOM CONTROLS ---
+      useEffect(() => {
+        const checkResponsive = () => {
+          const mobile = window.innerWidth < 768;
+          setIsMobile(mobile);
+          if (mobile) { setShowLeftPanel(false); setShowRightPanel(false); setZoom(1.0); }
+          else { setShowLeftPanel(true); setShowRightPanel(true); setZoom(1.5); }
+        };
+        checkResponsive();
+        window.addEventListener('resize', checkResponsive);
+        return () => window.removeEventListener('resize', checkResponsive);
+      }, []);
+
+      useEffect(() => {
+        const container = workspaceRef.current;
+        if (!container) return;
+
+        const handleWheel = (e) => {
+          if (e.ctrlKey || e.metaKey || e.shiftKey) { 
+            e.preventDefault();
+            const zoomChange = e.deltaY > 0 ? -0.1 : 0.1;
+            setZoom(z => Math.max(0.5, Math.min(4.0, z + zoomChange)));
+          }
+        };
+
+        let startDist = 0;
+        let startZoom = 1;
+
+        const handleTouchStart = (e) => {
+           if (e.touches.length === 2) {
+              startDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+              startZoom = zoomRef.current;
+           }
+        };
+
+        const handleTouchMove = (e) => {
+           if (e.touches.length === 2) {
+              e.preventDefault(); 
+              const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+              const scale = dist / startDist;
+              setZoom(Math.max(0.5, Math.min(4.0, startZoom * scale)));
+           }
+        };
+
+        container.addEventListener('wheel', handleWheel, { passive: false });
+        container.addEventListener('touchstart', handleTouchStart, { passive: false });
+        container.addEventListener('touchmove', handleTouchMove, { passive: false });
+
+        return () => {
+          container.removeEventListener('wheel', handleWheel);
+          container.removeEventListener('touchstart', handleTouchStart);
+          container.removeEventListener('touchmove', handleTouchMove);
+        };
+      }, [pdfDoc]);
+
+      // Load PDF.js
+      useEffect(() => {
+        const loadPdfJs = async () => {
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+          script.onload = () => {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            setPdfReady(true);
+          };
+          document.head.appendChild(script);
+        };
+        loadPdfJs();
+      }, []);
+
+      const handleFileUpload = async (e) => {
+        const file = e.target.files[0];
+        if (!file || !pdfReady) return;
+        const fileReader = new FileReader();
+        fileReader.onload = async function() {
+          const typedarray = new Uint8Array(this.result);
+          try {
+            const pdf = await window.pdfjsLib.getDocument(typedarray).promise;
+            setPdfDoc(pdf);
+            setNumPages(pdf.numPages);
+            setPageNum(1);
+          } catch (err) { console.error("Error loading PDF", err); }
+        };
+        fileReader.readAsArrayBuffer(file);
+        e.target.value = ''; 
+      };
+
+      // --- PDF RENDERING LOOP ---
+      useEffect(() => {
+        if (!pdfDoc) return;
+        let isMounted = true;
+        const renderTasks = [];
+
+        const renderPages = async () => {
+          const pages = viewMode === 'continuous' ? Array.from({length: numPages}, (_, i) => i + 1) : [pageNum];
+
+          for (const p of pages) {
+            if (!isMounted) break;
+            const canvas = canvasRefs.current[p];
+            if (!canvas) continue;
+
+            try {
+              const page = await pdfDoc.getPage(p);
+              const viewport = page.getViewport({ scale: zoom });
+              const context = canvas.getContext('2d');
+              canvas.height = viewport.height;
+              canvas.width = viewport.width;
+
+              const renderTask = page.render({ canvasContext: context, viewport });
+              renderTasks.push(renderTask);
+              await renderTask.promise; 
+            } catch (err) { }
+          }
+        };
+        renderPages();
+        
+        return () => {
+          isMounted = false;
+          renderTasks.forEach(t => { try { t.cancel(); } catch(e){} });
+        };
+      }, [pdfDoc, pageNum, zoom, viewMode, numPages]);
+
+      // --- HISTORY & STATE MANAGEMENT ---
+      const commitAnnotations = (newAnns) => {
+        setAnnotations(newAnns);
+        const newHistory = history.slice(0, historyIndex + 1);
+        newHistory.push(newAnns);
+        setHistory(newHistory);
+        setHistoryIndex(newHistory.length - 1);
+      };
+
+      const undo = () => { if (historyIndex > 0) { setHistoryIndex(historyIndex - 1); setAnnotations(history[historyIndex - 1]); setSelectedIds([]); } };
+      const redo = () => { if (historyIndex < history.length - 1) { setHistoryIndex(historyIndex + 1); setAnnotations(history[historyIndex + 1]); setSelectedIds([]); } };
+      const deleteSelected = () => { if (selectedIds.length === 0) return; commitAnnotations(annotations.filter(a => !selectedIds.includes(a.id))); setSelectedIds([]); };
+      const copySelected = () => { const selected = annotations.filter(a => selectedIds.includes(a.id)); if (selected.length > 0) setClipboard(selected); };
+
+      const pasteClipboard = () => {
+        if (clipboard.length === 0) return;
+        let dx = 2, dy = 2;
+        const targetPage = pasteAtCursor ? (latestMousePos.current.page || pageNum) : pageNum;
+
+        if (pasteAtCursor) {
+          const minX = Math.min(...clipboard.map(a => a.type === 'draw' ? Math.min(...a.points.map(p => p.x)) : a.x));
+          const minY = Math.min(...clipboard.map(a => a.type === 'draw' ? Math.min(...a.points.map(p => p.y)) : a.y));
+          dx = latestMousePos.current.x - minX;
+          dy = latestMousePos.current.y - minY;
+        }
+        
+        const newIds = [];
+        const newAnns = clipboard.map(a => {
+          const newId = Date.now() + Math.random();
+          newIds.push(newId);
+          if (a.type === 'draw') return { ...a, id: newId, page: targetPage, points: a.points.map(p => ({ x: p.x + dx, y: p.y + dy })) };
+          return { ...a, id: newId, page: targetPage, x: a.x + dx, y: a.y + dy };
+        });
+        commitAnnotations([...annotations, ...newAnns]);
+        setSelectedIds(newIds);
+        setTool('select');
+      };
+
+      // --- KEYBOARD SHORTCUTS ---
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+          if (e.key === 'Backspace' || e.key === 'Delete') deleteSelected();
+          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
+          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
+          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') { e.preventDefault(); copySelected(); }
+          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteClipboard(); }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+      }, [annotations, selectedIds, clipboard, historyIndex, history]);
+
+      // --- INTERACTION LOGIC (Per Page) ---
+      const handleBackgroundDown = (e, p) => {
+        if (!pdfDoc) return;
+        if (isMobile) { setShowLeftPanel(false); setShowRightPanel(false); }
+
+        // Prevent ghost drag of the canvas on desktop
+        if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'SELECT') {
+           e.preventDefault();
+        }
+
+        const rect = pageRefs.current[p].getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 100;
+        const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+        if (tool === 'select' && !e.shiftKey) {
+          try { e.currentTarget.setPointerCapture(e.pointerId); } catch(err) {}
+          setSelectedIds([]);
+          setIsPanning(true);
+          panStartRef.current = {
+            x: e.clientX,
+            y: e.clientY,
+            scrollLeft: workspaceRef.current.scrollLeft,
+            scrollTop: workspaceRef.current.scrollTop
+          };
+          return; 
+        } else if (tool === 'lasso' || (tool === 'select' && e.shiftKey)) {
+          setLasso({ startX: x, startY: y, currX: x, currY: y, page: p });
+          if (!e.shiftKey) setSelectedIds([]);
+        } else if (tool === 'draw' || tool === 'highlight') {
+          setIsDrawing(true);
+          setCurrentPath({ type: 'draw', drawType: tool, page: p, color: currentColor, strokeWidth: tool === 'draw' ? currentPenSize : currentHighlighterSize, points: [{x, y}] });
+        } else {
+          const newId = Date.now();
+          const content = tool === 'chord' ? 'C' : tool === 'keysig' ? currentKey : 'Notes...';
+          const newAnn = { 
+            id: newId, type: tool, page: p, x, y, 
+            content, color: currentColor, fontSize: currentFontSize, localKey: tool === 'chord' ? currentKey : undefined 
+          };
+          commitAnnotations([...annotations, newAnn]);
+          setSelectedIds([newId]);
+          setTool('select');
+          if (isMobile) setShowRightPanel(true);
+        }
+      };
+
+      const handleItemDown = (e, id, p) => {
+        e.stopPropagation();
+        if (tool !== 'select' && tool !== 'lasso') return;
+        if (isMobile) setShowRightPanel(true);
+
+        let newSelected = [...selectedIds];
+        if (e.shiftKey) {
+          if (newSelected.includes(id)) newSelected = newSelected.filter(i => i !== id);
+          else newSelected.push(id);
+        } else {
+          if (!newSelected.includes(id)) newSelected = [id];
+        }
+        setSelectedIds(newSelected);
+
+        const rect = pageRefs.current[p].getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 100;
+        const y = ((e.clientY - rect.top) / rect.height) * 100;
+        
+        const dragItems = annotations.filter(a => newSelected.includes(a.id)).map(a => ({ 
+          id: a.id, startX: a.x, startY: a.y, startPoints: a.type === 'draw' ? a.points : null 
+        }));
+        setDragContext({ mouseX: x, mouseY: y, items: dragItems, page: p });
+      };
+
+      const handlePointerMove = (e, p) => {
+        if (isPanning) {
+          const dx = e.clientX - panStartRef.current.x;
+          const dy = e.clientY - panStartRef.current.y;
+          if (workspaceRef.current) {
+            workspaceRef.current.scrollLeft = panStartRef.current.scrollLeft - dx;
+            workspaceRef.current.scrollTop = panStartRef.current.scrollTop - dy;
+          }
+          return;
+        }
+
+        const container = pageRefs.current[p];
+        if (!container) return;
+        const rect = container.getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 100;
+        const y = ((e.clientY - rect.top) / rect.height) * 100;
+        
+        latestMousePos.current = { x, y, page: p };
+
+        if (lasso && lasso.page === p) {
+          setLasso({ ...lasso, currX: x, currY: y });
+          const minX = Math.min(lasso.startX, x), maxX = Math.max(lasso.startX, x);
+          const minY = Math.min(lasso.startY, y), maxY = Math.max(lasso.startY, y);
+          const inBounds = annotations.filter(a => a.page === p && a.x >= minX && a.x <= maxX && a.y >= minY && a.y <= maxY).map(a => a.id);
+          setSelectedIds(inBounds);
+        } else if (dragContext && dragContext.page === p) {
+          const dx = x - dragContext.mouseX;
+          const dy = y - dragContext.mouseY;
+          setAnnotations(annotations.map(a => {
+            const startItem = dragContext.items.find(i => i.id === a.id);
+            if (startItem) {
+              if (a.type === 'draw') return { ...a, points: startItem.startPoints.map(p => ({ x: p.x + dx, y: p.y + dy })) };
+              return { ...a, x: startItem.startX + dx, y: startItem.startY + dy };
+            }
+            return a;
+          }));
+        } else if (isDrawing && currentPath && currentPath.page === p && (tool === 'draw' || tool === 'highlight')) {
+          setCurrentPath(prev => ({ ...prev, points: [...prev.points, {x, y}] }));
+        }
+      };
+
+      const handlePointerUp = (e) => {
+        if (isPanning) {
+           setIsPanning(false);
+           try { if (e && e.currentTarget) e.currentTarget.releasePointerCapture(e.pointerId); } catch(err) {}
+        }
+        if (lasso) setLasso(null);
+        else if (dragContext) { commitAnnotations(annotations); setDragContext(null); } 
+        else if (isDrawing && currentPath) { commitAnnotations([...annotations, { id: Date.now(), ...currentPath }]); setIsDrawing(false); setCurrentPath(null); }
+      };
+
+      const updateSelectedAnnotations = (updates, finalizeHistory = false) => {
+        const newAnns = annotations.map(a => selectedIds.includes(a.id) ? { ...a, ...updates } : a);
+        if (finalizeHistory) commitAnnotations(newAnns);
+        else setAnnotations(newAnns); 
+
+        if (preserveFormatting) {
+          if (updates.color) setCurrentColor(updates.color);
+          if (updates.fontSize) setCurrentFontSize(updates.fontSize);
+          if (updates.strokeWidth) {
+            const itemType = annotations.find(a => a.id === selectedIds[0])?.drawType;
+            if (itemType === 'highlight') setCurrentHighlighterSize(updates.strokeWidth);
+            else if (itemType === 'draw') setCurrentPenSize(updates.strokeWidth);
+          }
+        }
+      };
+
+      const createSvgPath = (points) => points?.reduce((acc, pt, i) => i === 0 ? `M ${pt.x} ${pt.y}` : `${acc} L ${pt.x} ${pt.y}`, '') || '';
+
+      const addDictEntry = () => {
+        if (!newDictEntry.trigger) return;
+        setChordDict([...chordDict, { ...newDictEntry, id: Date.now().toString() }]);
+        setNewDictEntry({ trigger: '', jazz: '', roman: '', nashville: '' });
+      };
+
+      const handleThumbnailClick = (p) => {
+        setPageNum(p);
+        if (viewMode === 'continuous' && pageRefs.current[p]) {
+          pageRefs.current[p].scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      };
+
+      const PrefSelect = ({ label, prefKey, options }) => {
+        const isCustomMode = customPrefModes[prefKey];
+        return (
+          <div className="space-y-2">
+            <label className="text-sm font-bold text-slate-700">{label}</label>
+            {isCustomMode ? (
+              <div className="flex gap-2">
+                <input 
+                  type="text" 
+                  value={chordPrefs[prefKey]} 
+                  onChange={e => setChordPrefs({...chordPrefs, [prefKey]: e.target.value})} 
+                  className="flex-1 border border-slate-300 rounded p-2 text-sm focus:ring-2 focus:ring-blue-500 font-bold" 
+                  autoFocus 
+                />
+                <button onClick={() => setCustomPrefModes({...customPrefModes, [prefKey]: false})} className="p-2 text-slate-500 hover:bg-slate-200 rounded transition-colors"><X size={16} /></button>
+              </div>
+            ) : (
+              <select 
+                value={options.map(o => o.value).includes(chordPrefs[prefKey]) ? chordPrefs[prefKey] : 'CUSTOM'}
+                onChange={e => {
+                  if (e.target.value === 'CUSTOM') {
+                    setCustomPrefModes({...customPrefModes, [prefKey]: true});
+                    setChordPrefs({...chordPrefs, [prefKey]: ''}); 
+                  } else {
+                    setChordPrefs({...chordPrefs, [prefKey]: e.target.value});
+                  }
+                }} 
+                className="w-full border border-slate-300 rounded p-2 text-sm focus:ring-2 focus:ring-blue-500"
+              >
+                {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                <option value="CUSTOM">Custom Symbol...</option>
+              </select>
+            )}
+          </div>
+        );
+      };
+
+      const handleScroll = () => {
+        if (viewMode !== 'continuous') return;
+        const container = workspaceRef.current;
+        if (!container) return;
+        let closestPage = pageNum;
+        let minDistance = Infinity;
+        
+        Object.entries(pageRefs.current).forEach(([p, el]) => {
+          if (!el) return;
+          const rect = el.getBoundingClientRect();
+          const containerCenter = container.getBoundingClientRect().top + container.clientHeight / 3; 
+          const pageCenter = rect.top + rect.height / 2;
+          const distance = Math.abs(containerCenter - pageCenter);
+          
+          if (distance < minDistance) {
+            minDistance = distance;
+            closestPage = Number(p);
+          }
+        });
+        
+        if (closestPage !== pageNum) setPageNum(closestPage);
+      };
+
+      const toggleViewMode = (mode) => {
+        setViewMode(mode);
+        if (mode === 'continuous') {
+          setTimeout(() => {
+            if (pageRefs.current[pageNum]) {
+              pageRefs.current[pageNum].scrollIntoView({ behavior: 'auto', block: 'start' });
+            }
+          }, 50);
+        }
+      };
+
+      const pagesToRender = viewMode === 'continuous' ? Array.from({length: numPages}, (_, i) => i + 1) : [pageNum];
+
+      return (
+        <div className="h-screen w-full bg-slate-50 flex flex-col font-sans overflow-hidden">
+          {/* Top Header */}
+          <header className="bg-slate-900 text-white p-3 flex items-center justify-between z-30 shadow-md print:hidden flex-shrink-0">
+            <div className="flex items-center gap-3 md:gap-4">
+              <button onClick={() => setShowLeftPanel(!showLeftPanel)} className="p-1.5 rounded hover:bg-slate-800 transition-colors"><Menu size={20} /></button>
+              <h1 className="text-lg md:text-xl font-bold tracking-tight hidden sm:block">Score Annotator</h1>
+              <label className="cursor-pointer bg-slate-800 hover:bg-slate-700 text-white px-3 md:px-4 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-2 border border-slate-700">
+                <Upload size={16} /> <span className="hidden sm:inline">PDF</span>
+                <input type="file" accept="application/pdf" ref={fileInputRef} className="hidden" onChange={handleFileUpload} />
+              </label>
+            </div>
+            <div className="flex items-center gap-1 md:gap-2">
+               <button onClick={undo} disabled={historyIndex === 0} className="p-1.5 rounded hover:bg-slate-800 disabled:opacity-30" title="Undo"><Undo size={18} /></button>
+               <button onClick={redo} disabled={historyIndex === history.length - 1} className="p-1.5 rounded hover:bg-slate-800 disabled:opacity-30" title="Redo"><Redo size={18} /></button>
+               <div className="w-px h-6 bg-slate-700 mx-1 md:mx-2 hidden sm:block" />
+               
+               <div className="hidden lg:flex items-center gap-2 mr-2">
+                 <button onClick={exportProject} className="flex items-center gap-2 bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-md text-sm font-medium transition-colors text-white" title="Download Analysis Project">
+                    <Save size={16} /> Save Data
+                 </button>
+                 <label className="cursor-pointer flex items-center gap-2 bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-md text-sm font-medium transition-colors text-white" title="Load Analysis Project">
+                    <FolderOpen size={16} /> Load Data
+                    <input type="file" accept=".json" ref={projectImportRef} className="hidden" onChange={importProject} />
+                 </label>
+               </div>
+               
+               <button onClick={() => window.print()} className="hidden md:flex items-center gap-2 bg-blue-600 hover:bg-blue-500 px-3 md:px-4 py-1.5 rounded-md text-sm font-medium transition-colors" title="Print Score">
+                  <Download size={16} /> Print
+               </button>
+               
+               <div className="w-px h-6 bg-slate-700 mx-1 md:mx-2" />
+               <button onClick={() => setShowInfoModal(true)} className="p-1.5 rounded hover:bg-slate-800 transition-colors ml-1 text-slate-300 hover:text-white" title="Help & Info"><HelpCircle size={20} /></button>
+               <button onClick={() => setShowRightPanel(!showRightPanel)} className="p-1.5 rounded hover:bg-slate-800 transition-colors ml-1"><PanelRight size={20} /></button>
+            </div>
+          </header>
+
+          <div className="flex flex-1 overflow-hidden h-full relative">
+            {/* Left Toolbar */}
+            <aside className={`absolute md:relative top-0 left-0 h-full bg-white border-r border-slate-200 flex flex-col items-center py-4 gap-4 z-20 print:hidden flex-shrink-0 overflow-y-auto transition-transform duration-300 ease-in-out w-16 ${showLeftPanel ? 'translate-x-0' : '-translate-x-full hidden md:flex md:w-0 md:-ml-16 md:opacity-0'}`}>
+              {[
+                { id: 'select', icon: MousePointer2, label: 'Select / Pan View' },
+                { id: 'lasso', icon: BoxSelect, label: 'Lasso Select (or Shift+Drag)' },
+                { id: 'chord', icon: Music, label: 'Add Chord' },
+                { id: 'keysig', icon: Key, label: 'Key Change' },
+                { id: 'text', icon: Type, label: 'Text/Notes' },
+                { id: 'draw', icon: PenTool, label: 'Pen' },
+                { id: 'highlight', icon: Highlighter, label: 'Highlighter' }
+              ].map(t => (
+                <button key={t.id} onClick={() => { setTool(t.id); setSelectedIds([]); if(isMobile) setShowLeftPanel(false); }} title={t.label} className={`p-3 rounded-xl transition-all flex-shrink-0 ${tool === t.id ? 'bg-blue-100 text-blue-600 shadow-inner' : 'text-slate-500 hover:bg-slate-100'}`}>
+                  <t.icon size={22} strokeWidth={tool === t.id ? 2.5 : 2} />
+                </button>
+              ))}
+              <div className="w-8 border-t border-slate-200 my-2 flex-shrink-0" />
+              <input type="color" value={currentColor} onChange={e => setCurrentColor(e.target.value)} className="w-8 h-8 rounded cursor-pointer border-0 p-0 flex-shrink-0" title="Default Color" />
+            </aside>
+
+            {isMobile && showLeftPanel && <div className="absolute inset-0 bg-black/20 z-10" onClick={() => setShowLeftPanel(false)} />}
+
+            {/* Main Workspace Area */}
+            <main className="flex-1 h-full relative flex flex-col bg-slate-100/50 overflow-hidden print:p-0 print:bg-white" tabIndex="0">
+              {!pdfDoc ? (
+                <div className="m-auto text-slate-400 flex flex-col items-center gap-4 text-center px-4">
+                  <Upload size={48} className="opacity-20" />
+                  <p>Load a PDF score to start analyzing.</p>
+                  {isMobile && <p className="text-sm opacity-50 mt-2">Use the menu icons top left/right for tools and settings.</p>}
+                </div>
+              ) : (
+                <>
+                  {/* Sticky Top Controls & Gallery */}
+                  <div className="flex-shrink-0 w-full bg-white/90 backdrop-blur-sm border-b border-slate-200 shadow-sm z-30 print:hidden flex flex-col transition-all">
+                    <div className="flex flex-wrap items-center justify-between gap-3 p-3 max-w-6xl mx-auto w-full">
+                      <div className="flex items-center gap-2 md:gap-3 bg-slate-100 rounded-full px-2 py-1 border border-slate-200">
+                        <button disabled={pageNum <= 1} onClick={() => handleThumbnailClick(Math.max(1, pageNum - 1))} className="p-1.5 rounded-full hover:bg-white hover:shadow-sm disabled:opacity-50 text-slate-700 transition-all"><ChevronLeft size={16} /></button>
+                        <span className="text-xs md:text-sm font-bold text-slate-700 font-mono select-none">Pg {pageNum} / {numPages}</span>
+                        <button disabled={pageNum >= numPages} onClick={() => handleThumbnailClick(Math.min(numPages, pageNum + 1))} className="p-1.5 rounded-full hover:bg-white hover:shadow-sm disabled:opacity-50 text-slate-700 transition-all"><ChevronRight size={16} /></button>
+                      </div>
+                      
+                      <div className="flex items-center gap-2 md:gap-3 bg-slate-100 rounded-full p-1 border border-slate-200">
+                        <button onClick={() => toggleViewMode('single')} className={`flex items-center gap-1.5 px-3 py-1 text-xs md:text-sm font-bold rounded-full transition-all ${viewMode === 'single' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}>
+                           <File size={14}/> <span className="hidden sm:inline">Single</span>
+                        </button>
+                        <button onClick={() => toggleViewMode('continuous')} className={`flex items-center gap-1.5 px-3 py-1 text-xs md:text-sm font-bold rounded-full transition-all ${viewMode === 'continuous' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}>
+                           <Rows size={14}/> <span className="hidden sm:inline">Scroll</span>
+                        </button>
+                      </div>
+
+                      <div className="flex items-center gap-3">
+                        <button onClick={() => setShowGallery(!showGallery)} className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-colors border ${showGallery ? 'bg-blue-100 text-blue-700 border-blue-200' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>
+                          <LayoutGrid size={16} /> <span className="hidden sm:inline">Gallery</span>
+                        </button>
+                        <div className="w-px h-6 bg-slate-300 hidden md:block" />
+                        <div className="flex items-center gap-1 md:gap-2 bg-slate-100 rounded-full px-2 py-1 border border-slate-200">
+                          <button onClick={() => setZoom(z => Math.max(0.5, z - 0.1))} className="p-1.5 rounded-full hover:bg-white hover:shadow-sm text-slate-700 transition-all" title="Zoom Out"><ZoomOut size={16} /></button>
+                          <span className="text-xs md:text-sm font-bold text-slate-700 font-mono w-10 md:w-12 text-center select-none">{Math.round(zoom * 100)}%</span>
+                          <button onClick={() => setZoom(z => Math.min(4.0, z + 0.1))} className="p-1.5 rounded-full hover:bg-white hover:shadow-sm text-slate-700 transition-all" title="Zoom In"><ZoomIn size={16} /></button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Horizontal Thumbnail Gallery */}
+                    {showGallery && (
+                      <div className="flex overflow-x-auto gap-3 p-4 bg-slate-100/50 border-t border-slate-200 w-full shadow-inner scroll-smooth">
+                        {Array.from({length: numPages}, (_, i) => i + 1).map(p => (
+                          <div key={p} className="flex flex-col items-center gap-1.5">
+                            <PageThumbnail pdfDoc={pdfDoc} pageNum={p} isActive={p === pageNum} onClick={() => handleThumbnailClick(p)} />
+                            <span className={`text-xs font-mono font-bold ${p === pageNum ? 'text-blue-600' : 'text-slate-500'}`}>{p}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Scrollable Canvas Viewport */}
+                  <div ref={workspaceRef} onScroll={handleScroll} className="flex-1 overflow-auto w-full relative p-4 md:p-8 flex flex-col items-center print:p-0">
+                    {pagesToRender.map(p => (
+                      <div 
+                        key={p}
+                        ref={el => pageRefs.current[p] = el}
+                        className={`relative w-fit h-fit bg-white shadow-2xl select-none touch-none print:shadow-none ${viewMode === 'continuous' ? 'mb-8' : ''} ${tool === 'draw' || tool === 'highlight' ? 'cursor-crosshair' : tool === 'lasso' ? 'cursor-crosshair' : tool === 'select' ? (isPanning ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-text'} ${dragContext && dragContext.page === p ? 'cursor-grabbing' : ''}`} 
+                        onPointerDown={(e) => handleBackgroundDown(e, p)} 
+                        onPointerMove={(e) => handlePointerMove(e, p)} 
+                        onPointerUp={(e) => handlePointerUp(e)} 
+                        onPointerLeave={(e) => handlePointerUp(e)}
+                      >
+                        <canvas ref={el => canvasRefs.current[p] = el} className="block print:max-w-none origin-top-left" />
+                        
+                        {lasso && lasso.page === p && <div className="absolute border border-blue-500 bg-blue-500/20 z-30 pointer-events-none" style={{ left: `${Math.min(lasso.startX, lasso.currX)}%`, top: `${Math.min(lasso.startY, lasso.currY)}%`, width: `${Math.abs(lasso.currX - lasso.startX)}%`, height: `${Math.abs(lasso.currY - lasso.startY)}%` }}/>}
+                        
+                        <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible">
+                          {annotations.filter(a => a.type === 'draw' && a.page === p).map(ann => (
+                             <path key={ann.id} d={createSvgPath(ann.points)} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth || (ann.drawType === 'highlight' ? 16 : 3)} strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={ann.drawType === 'highlight' ? 0.4 : 1} style={ann.drawType === 'highlight' ? { mixBlendMode: 'multiply' } : {}} className={selectedIds.includes(ann.id) ? 'opacity-50 drop-shadow-md' : ''} />
+                          ))}
+                          {currentPath && currentPath.page === p && <path d={createSvgPath(currentPath.points)} fill="none" stroke={currentPath.color} strokeWidth={currentPath.strokeWidth} strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={currentPath.drawType === 'highlight' ? 0.4 : 1} style={currentPath.drawType === 'highlight' ? { mixBlendMode: 'multiply' } : {}} />}
+                        </svg>
+
+                        {annotations.filter(a => (a.type === 'chord' || a.type === 'text' || a.type === 'keysig') && a.page === p).map(ann => {
+                          const isSelected = selectedIds.includes(ann.id);
+                          if (ann.type === 'keysig') {
+                            return <div key={ann.id} onPointerDown={(e) => handleItemDown(e, ann.id, p)} className={`absolute z-20 px-2 py-1 font-bold rounded-sm border-2 transition-colors ${isSelected ? 'ring-4 ring-blue-300 cursor-grab active:cursor-grabbing' : 'hover:ring-2 hover:ring-slate-300'}`} style={{ left: `${ann.x}%`, top: `${ann.y}%`, color: ann.color, borderColor: ann.color, backgroundColor: 'white', fontSize: `${ann.fontSize || 16}px`, transform: 'translate(-50%, -50%)' }}>Key: {ann.content}</div>;
+                          }
+                          if (ann.type === 'text') {
+                            return <div key={ann.id} onPointerDown={(e) => handleItemDown(e, ann.id, p)} className={`absolute z-20 whitespace-pre-wrap px-2 py-1 ${(tool === 'select' || tool === 'lasso') && !dragContext ? 'hover:ring-1 hover:ring-slate-300' : ''} ${isSelected ? 'ring-2 ring-blue-500 bg-blue-50/50 rounded cursor-grab active:cursor-grabbing' : ''}`} style={{ left: `${ann.x}%`, top: `${ann.y}%`, color: ann.color, fontSize: `${ann.fontSize || 16}px` }}>{ann.content}</div>;
+                          }
+                          if (ann.type === 'chord') {
+                            const translated = parseAndTranslateChord(ann.content, ann.localKey || currentKey, chordPrefs, chordDict);
+                            return (
+                              <div key={ann.id} onPointerDown={(e) => handleItemDown(e, ann.id, p)} className={`absolute z-20 flex flex-col items-center justify-center p-1 md:p-1.5 rounded transition-colors ${(tool === 'select' || tool === 'lasso') && !dragContext ? 'hover:border-blue-400' : ''} ${isSelected ? 'bg-blue-100 ring-2 ring-blue-500 cursor-grab active:cursor-grabbing' : 'bg-white/80 border border-slate-300'}`} style={{ left: `${ann.x}%`, top: `${ann.y}%`, color: ann.color, fontSize: `${ann.fontSize || 16}px`, transform: 'translate(-50%, -50%)' }}>
+                                 <span className="font-bold leading-none mb-1">{translated.jazz}</span>
+                                 <span className="text-[0.8em] text-slate-600 font-serif leading-none mb-0.5">{translated.roman}</span>
+                                 <span className="text-[0.7em] text-slate-500 font-mono leading-none">{translated.nashville}</span>
+                              </div>
+                            );
+                          }
+                          return null;
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </main>
+
+            {isMobile && showRightPanel && <div className="absolute inset-0 bg-black/20 z-30" onClick={() => setShowRightPanel(false)} />}
+
+            {/* Right Sidebar - Properties Panel */}
+            <aside className={`absolute right-0 top-0 h-full bg-white border-l border-slate-200 flex flex-col z-40 shadow-lg print:hidden flex-shrink-0 transition-transform duration-300 ease-in-out md:relative w-80 max-w-[85vw] ${showRightPanel ? 'translate-x-0' : 'translate-x-full hidden md:flex md:w-0 md:-mr-80 md:opacity-0'}`}>
+              <div className="p-4 border-b border-slate-200 bg-slate-50 flex-shrink-0 space-y-3">
+                <h2 className="font-bold text-slate-800 flex items-center gap-2">
+                  <Settings size={18} /> Score Settings
+                </h2>
+                
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 bg-white p-2 rounded border border-slate-200 shadow-sm cursor-pointer hover:border-blue-400 transition-colors">
+                    <input type="checkbox" checked={pasteAtCursor} onChange={(e) => setPasteAtCursor(e.target.checked)} className="cursor-pointer" />
+                    <span className="text-sm font-medium text-slate-600 select-none">Paste at Cursor Location</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 bg-white p-2 rounded border border-slate-200 shadow-sm cursor-pointer hover:border-blue-400 transition-colors">
+                    <input type="checkbox" checked={preserveFormatting} onChange={(e) => {
+                      const checked = e.target.checked;
+                      setPreserveFormatting(checked);
+                      if (!checked) {
+                        setCurrentColor('#2563eb');
+                        setCurrentFontSize(16);
+                        setCurrentPenSize(3);
+                        setCurrentHighlighterSize(16);
+                      }
+                    }} className="cursor-pointer" />
+                    <span className="text-sm font-medium text-slate-600 select-none">Preserve Formatting</span>
+                  </label>
+                </div>
+                
+                <button onClick={() => setShowDictModal(true)} className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-white p-2 rounded shadow-sm text-sm font-medium transition-colors mt-2">
+                  <BookOpen size={16} /> Dictionary & Prefs
+                </button>
+
+                <div className="flex lg:hidden items-center gap-2 pt-2 border-t border-slate-200">
+                   <button onClick={exportProject} className="flex-1 flex justify-center items-center gap-2 bg-slate-200 hover:bg-slate-300 p-2 rounded-md text-sm font-medium transition-colors text-slate-700">
+                      <Save size={14} /> Save
+                   </button>
+                   <label className="cursor-pointer flex-1 flex justify-center items-center gap-2 bg-slate-200 hover:bg-slate-300 p-2 rounded-md text-sm font-medium transition-colors text-slate-700">
+                      <FolderOpen size={14} /> Load
+                      <input type="file" accept=".json" className="hidden" onChange={importProject} />
+                   </label>
+                </div>
+              </div>
+
+              <div className="p-4 flex-1 overflow-y-auto">
+                 {selectedIds.length === 0 ? (
+                    <div className="space-y-6">
+                      <div className="text-center text-slate-400 mt-10 px-4">
+                        <MousePointer2 size={32} className="mx-auto mb-3 opacity-30" />
+                        <p className="text-sm">Select an annotation to edit properties.<br/><br/>(Select Tool to pan, Lasso to highlight multiple)</p>
+                      </div>
+                    </div>
+                 ) : (
+                    <div className="space-y-6">
+                       <div className="flex items-center justify-between bg-blue-50 p-2 rounded-lg border border-blue-100">
+                          <h3 className="font-bold text-blue-800 text-sm">
+                            {selectedIds.length === 1 ? '1 Item Selected' : `${selectedIds.length} Items Selected`}
+                          </h3>
+                          <div className="flex gap-1">
+                            <button onClick={copySelected} className="text-blue-600 hover:bg-blue-100 p-1.5 rounded" title="Copy"><Copy size={16} /></button>
+                            <button onClick={deleteSelected} className="text-red-500 hover:bg-red-50 p-1.5 rounded" title="Delete"><Trash2 size={16} /></button>
+                          </div>
+                       </div>
+
+                       {/* Content Editor */}
+                       {selectedIds.length === 1 && annotations.find(a => a.id === selectedIds[0])?.type !== 'draw' && (
+                         <div className="space-y-2">
+                           <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Content</label>
+                           {annotations.find(a => a.id === selectedIds[0])?.type === 'keysig' ? (
+                              <select value={annotations.find(a => a.id === selectedIds[0])?.content || ''} onChange={e => { updateSelectedAnnotations({ content: e.target.value }, false); commitAnnotations(annotations); }} className="w-full border border-slate-300 rounded-md p-2 font-bold text-sm">
+                                {PITCHES.map(p => <option key={p} value={p}>{p}</option>)}
+                              </select>
+                           ) : annotations.find(a => a.id === selectedIds[0])?.type === 'chord' ? (
+                              <input type="text" value={annotations.find(a => a.id === selectedIds[0])?.content || ''} onChange={e => updateSelectedAnnotations({ content: e.target.value }, false)} onBlur={() => commitAnnotations(annotations)} className="w-full border border-slate-300 rounded-md p-2 font-mono text-sm" />
+                           ) : (
+                              <textarea value={annotations.find(a => a.id === selectedIds[0])?.content || ''} onChange={e => updateSelectedAnnotations({ content: e.target.value }, false)} onBlur={() => commitAnnotations(annotations)} className="w-full border border-slate-300 rounded-md p-2 text-sm h-32 resize-none" />
+                           )}
+
+                           {annotations.find(a => a.id === selectedIds[0])?.type === 'chord' && (
+                             <div className="space-y-2 mt-4 pt-4 border-t border-slate-100">
+                               <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Key for Analysis</label>
+                               <select value={annotations.find(a => a.id === selectedIds[0])?.localKey || currentKey} onChange={e => { setCurrentKey(e.target.value); updateSelectedAnnotations({ localKey: e.target.value }, false); commitAnnotations(annotations); }} className="w-full border border-slate-300 rounded-md p-2 text-sm font-bold">
+                                 {PITCHES.map(p => <option key={p} value={p}>{p}</option>)}
+                               </select>
+                             </div>
+                           )}
+                         </div>
+                       )}
+
+                       {/* Formatting */}
+                       <div className="space-y-4 pt-2">
+                         <div className="space-y-2">
+                            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1"><Palette size={14}/> Color</label>
+                            <div className="flex gap-2 flex-wrap">
+                              {['#000000', '#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#8b5cf6'].map(color => (
+                                <button key={color} onClick={() => updateSelectedAnnotations({ color }, true)} className={`w-6 h-6 rounded-full border-2 border-transparent hover:scale-110`} style={{ backgroundColor: color }} />
+                              ))}
+                              <input type="color" onChange={e => updateSelectedAnnotations({ color: e.target.value }, true)} className="w-6 h-6 rounded border-0 p-0 cursor-pointer ml-auto" />
+                            </div>
+                         </div>
+                         {annotations.filter(a => selectedIds.includes(a.id)).length > 0 && (
+                           <div className="space-y-2">
+                              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1"><TypeIcon size={14}/> Size / Thickness</label>
+                              <input type="range" min="1" max="50" value={annotations.find(a => a.id === selectedIds[0])?.fontSize || annotations.find(a => a.id === selectedIds[0])?.strokeWidth || 16} onChange={e => updateSelectedAnnotations({ fontSize: parseInt(e.target.value), strokeWidth: parseInt(e.target.value) }, false)} onMouseUp={() => commitAnnotations(annotations)} onTouchEnd={() => commitAnnotations(annotations)} className="w-full" />
+                           </div>
+                         )}
+                       </div>
+                    </div>
+                 )}
+              </div>
+            </aside>
+          </div>
+
+          {/* Info & Help Modal */}
+          {showInfoModal && (
+            <div className="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4">
+              <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
+                <div className="flex items-center justify-between p-4 border-b border-slate-200 bg-slate-50 flex-shrink-0">
+                  <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><HelpCircle size={20} className="text-blue-600" /> How to Use Score Annotator</h2>
+                  <button onClick={() => setShowInfoModal(false)} className="text-slate-500 hover:bg-slate-200 p-1.5 rounded-md transition-colors"><X size={20} /></button>
+                </div>
+                <div className="p-6 overflow-y-auto flex-1 bg-white space-y-5 text-sm text-slate-700">
+                  <p><strong>Panning & Zooming:</strong><br/>Use the <em>Select</em> tool and click/drag the background to pan around the score. To zoom, hold <code>Shift + Scroll</code> on your desktop, or use a pinch gesture on your trackpad or mobile device.</p>
+                  <p><strong>Adding Annotations:</strong><br/>Choose a tool from the left sidebar (Chord, Text, Key, Pen, Highlighter) and click anywhere on the score to place it.</p>
+                  <p><strong>Smart Chords:</strong><br/>Select the Chord tool and type a chord like <code>Cmaj7/G</code> or <code>V7/V</code>. The app will automatically translate it into Jazz, Roman, and Nashville notation based on the selected key.</p>
+                  <p><strong>Editing & Properties:</strong><br/>Click any annotation with the <em>Select</em> tool to open its properties in the right sidebar. You can change colors, sizes, content, and the local key for Roman numeral analysis there.</p>
+                  <p><strong>Preserve Formatting:</strong><br/>Enable this in the Score Settings to automatically apply the color and size of your last edited annotation to new ones. Disabling it resets your tools to standard defaults.</p>
+                  <p><strong>Selecting Multiple Items:</strong><br/>Use the <em>Lasso</em> tool (or hold <code>Shift + Drag</code> while using the Select tool) to highlight and move multiple annotations at once.</p>
+                  <div>
+                    <strong>Keyboard Shortcuts:</strong>
+                    <ul className="list-disc pl-5 mt-2 space-y-1 font-mono text-xs">
+                      <li><span className="bg-slate-100 px-1 rounded border border-slate-200">Ctrl/Cmd + C</span> : Copy selected items</li>
+                      <li><span className="bg-slate-100 px-1 rounded border border-slate-200">Ctrl/Cmd + V</span> : Paste at your mouse cursor</li>
+                      <li><span className="bg-slate-100 px-1 rounded border border-slate-200">Ctrl/Cmd + Z</span> : Undo</li>
+                      <li><span className="bg-slate-100 px-1 rounded border border-slate-200">Ctrl/Cmd + Y</span> : Redo</li>
+                      <li><span className="bg-slate-100 px-1 rounded border border-slate-200">Delete</span> : Remove selected items</li>
+                    </ul>
+                  </div>
+                </div>
+                <div className="p-4 border-t border-slate-200 bg-slate-50 flex justify-between items-center flex-shrink-0">
+                  <span className="text-[10px] text-slate-400 select-none">©2026 Warren Co. All rights reserved.</span>
+                  <button onClick={() => setShowInfoModal(false)} className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded-md font-medium transition-colors">Got it!</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Dictionary Modal */}
+          {showDictModal && (
+            <div className="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4">
+              <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
+                <div className="flex items-center justify-between p-4 border-b border-slate-200 bg-slate-50">
+                  <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><BookOpen size={20} /> Dictionary & Formatting</h2>
+                  <button onClick={() => setShowDictModal(false)} className="text-slate-500 hover:bg-slate-200 p-1.5 rounded-md transition-colors"><X size={20} /></button>
+                </div>
+                
+                <div className="flex border-b border-slate-200 bg-white">
+                  <button onClick={() => setDictTab('prefs')} className={`flex-1 py-3 text-sm font-bold transition-colors ${dictTab === 'prefs' ? 'text-blue-600 border-b-2 border-blue-600 bg-blue-50/50' : 'text-slate-500 hover:bg-slate-50'}`}>Global Preferences</button>
+                  <button onClick={() => setDictTab('library')} className={`flex-1 py-3 text-sm font-bold transition-colors ${dictTab === 'library' ? 'text-blue-600 border-b-2 border-blue-600 bg-blue-50/50' : 'text-slate-500 hover:bg-slate-50'}`}>Custom Chord Library</button>
+                </div>
+
+                <div className="p-6 overflow-y-auto flex-1 bg-slate-50/50">
+                  {dictTab === 'prefs' ? (
+                    <div className="space-y-6">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <PrefSelect label="Minor Symbol" prefKey="minor" options={[{label: 'm (e.g. Cm7)', value: 'm'}, {label: '- (e.g. C-7)', value: '-'}]} />
+                        <PrefSelect label="Major Symbol" prefKey="major" options={[{label: 'maj (e.g. Cmaj7)', value: 'maj'}, {label: 'Δ (e.g. CΔ7)', value: 'Δ'}, {label: 'M (e.g. CM7)', value: 'M'}]} />
+                        <PrefSelect label="Diminished" prefKey="dim" options={[{label: 'dim', value: 'dim'}, {label: '°', value: '°'}]} />
+                        <PrefSelect label="Half-Diminished" prefKey="halfDim" options={[{label: 'm7b5', value: 'm7b5'}, {label: 'ø', value: 'ø'}]} />
+                        
+                        <div className="space-y-2 md:col-span-2">
+                          <label className="text-sm font-bold text-slate-700">Roman Numeral Minor Casing</label>
+                          <select value={chordPrefs.romanCase} onChange={e => setChordPrefs({...chordPrefs, romanCase: e.target.value})} className="w-full border border-slate-300 rounded p-2 text-sm focus:ring-2 focus:ring-blue-500">
+                            <option value="lower">Lowercase (e.g. ii7)</option>
+                            <option value="upper">Uppercase with minor symbol (e.g. II-7 or IIm7)</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      <div className="bg-white p-4 rounded-lg border border-slate-200 shadow-sm space-y-3">
+                        <h3 className="font-bold text-slate-700 text-sm">Add New Custom Chord</h3>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                          <input type="text" placeholder="Trigger (e.g. T)" value={newDictEntry.trigger} onChange={e => setNewDictEntry({...newDictEntry, trigger: e.target.value})} className="border border-slate-300 rounded p-2 text-sm focus:ring-2 focus:ring-blue-500" />
+                          <input type="text" placeholder="Jazz (e.g. Fm7b5)" value={newDictEntry.jazz} onChange={e => setNewDictEntry({...newDictEntry, jazz: e.target.value})} className="border border-slate-300 rounded p-2 text-sm focus:ring-2 focus:ring-blue-500" />
+                          <input type="text" placeholder="Roman (e.g. iv7b5)" value={newDictEntry.roman} onChange={e => setNewDictEntry({...newDictEntry, roman: e.target.value})} className="border border-slate-300 rounded p-2 text-sm focus:ring-2 focus:ring-blue-500" />
+                          <input type="text" placeholder="Nashville (e.g. 4m7b5)" value={newDictEntry.nashville} onChange={e => setNewDictEntry({...newDictEntry, nashville: e.target.value})} className="border border-slate-300 rounded p-2 text-sm focus:ring-2 focus:ring-blue-500" />
+                        </div>
+                        <button onClick={addDictEntry} disabled={!newDictEntry.trigger} className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white p-2 rounded text-sm font-bold flex items-center justify-center gap-2 transition-colors">
+                          <Plus size={16} /> Add to Library
+                        </button>
+                      </div>
+
+                      <div className="space-y-2">
+                        <h3 className="font-bold text-slate-700 text-sm">Your Library</h3>
+                        {chordDict.length === 0 ? (
+                          <p className="text-slate-500 text-sm italic">No custom chords yet.</p>
+                        ) : (
+                          <div className="border border-slate-200 rounded-lg overflow-hidden">
+                            <table className="w-full text-left text-sm">
+                              <thead className="bg-slate-100 text-slate-600">
+                                <tr><th className="p-2">Trigger</th><th className="p-2">Jazz</th><th className="p-2">Roman</th><th className="p-2">Nashville</th><th className="p-2 w-10"></th></tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100 bg-white">
+                                {chordDict.map(d => (
+                                  <tr key={d.id} className="hover:bg-slate-50">
+                                    <td className="p-2 font-bold text-slate-800">{d.trigger}</td>
+                                    <td className="p-2 font-mono text-slate-600">{d.jazz}</td>
+                                    <td className="p-2 font-serif text-slate-600">{d.roman}</td>
+                                    <td className="p-2 font-mono text-slate-600">{d.nashville}</td>
+                                    <td className="p-2 text-center">
+                                      <button onClick={() => setChordDict(chordDict.filter(x => x.id !== d.id))} className="text-slate-400 hover:text-red-500"><Trash2 size={16} /></button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          <style>{`
+            @media print {
+              @page { margin: 0; size: auto; }
+              body { -webkit-print-color-adjust: exact; background: white; }
+            }
+          `}</style>
+        </div>
+      );
+    }
+
+    const root = createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
